@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+trigger_event.json
+fix_report.md

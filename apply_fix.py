@@ -4,8 +4,8 @@ CI-side tool — packaged as a standalone GitHub Action (composite action).
 
 This script's home is its OWN repo (published separately from any client's
 repo). A client's workflow references it as `uses: <org>/<this-repo>@v1` —
-GitHub checks this repo out into a side directory and runs this script, while
-the CLIENT's repo is checked out as the actual working directory. So:
+GitHub fetches this repo and runs this script, while the CLIENT's repo is
+checked out as the actual working directory. So:
 
   - `os.getcwd()` / relative paths like `src/` refer to the CLIENT's repo.
   - This script's own directory (`Path(__file__).parent`) is itself, wherever
@@ -15,11 +15,16 @@ It never touches the client's git history directly; it writes fixed files
 into the client's working tree, and the workflow's own `git commit`/`git push`
 steps (or an action like create-pull-request) turn that into a real PR.
 
-Input: the trigger payload arrives as the JSON string in $TRIGGER_PAYLOAD
-(GitHub Actions passes `github.event.client_payload` this way — see
-action.yml). Output: LLM key comes from $OPENAI_API_KEY, which is the
-CLIENT's own secret, set in the CLIENT's repo settings — this script never
-carries or sees any credential belonging to the detection-engine side.
+Trigger flow (polling design — we never call the client, they poll us): an
+earlier step in the CLIENT's own workflow calls our change-feed API on a
+schedule, gets back a JSON body describing what changed (if anything), and
+passes that JSON straight through to this action as the trigger-payload
+input — see action.yml. This script never talks to our API directly and
+never receives more than that one JSON blob.
+
+Output: LLM key comes from $OPENAI_API_KEY, which is the CLIENT's own
+secret, set in the CLIENT's repo settings — this script never carries or
+sees any credential belonging to the detection-engine side.
 """
 import json
 import os
@@ -44,18 +49,25 @@ REPORT_FILE = CLIENT_REPO / "fix_report.md"
 
 
 def load_trigger():
-    """Read the trigger event GitHub Actions handed us via client_payload.
+    """Read the trigger event the client's workflow got back from polling
+    our change-feed API, and passed through to this action (see action.yml).
 
     For a manual/local run (no real GitHub Actions event), set TRIGGER_PAYLOAD
-    yourself, e.g.: export TRIGGER_PAYLOAD="$(cat trigger_event.json)"
+    yourself, e.g.: export TRIGGER_PAYLOAD="$(curl -s .../v1/changes?... )"
     """
     raw = os.environ.get("TRIGGER_PAYLOAD")
     if not raw:
-        print("[ci-tool] TRIGGER_PAYLOAD env var not set. In GitHub Actions "
-              "this comes from client_payload (see action.yml). For a manual "
-              "run: export TRIGGER_PAYLOAD=\"$(cat trigger_event.json)\"")
+        print("[ci-tool] TRIGGER_PAYLOAD env var not set. In the real "
+              "workflow this comes from the polling step's response (see "
+              "action.yml). For a manual run: "
+              "export TRIGGER_PAYLOAD=\"$(cat trigger_event.json)\"")
         sys.exit(1)
-    return json.loads(raw)
+
+    payload = json.loads(raw)
+    if not payload.get("has_change", True):
+        print("[ci-tool] Polling response says no change. Nothing to do.")
+        sys.exit(0)
+    return payload
 
 
 def scan_repo_for_field(field_name):
