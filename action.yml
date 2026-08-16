@@ -1,0 +1,26 @@
+# Makes ci-tool/ a reusable GitHub Action, publishable from its OWN repo.
+# A client's workflow references this via `uses: <your-org>/<this-repo>@v1`
+# — GitHub fetches this repo at run time and runs the steps below, with the
+# CLIENT's repo already checked out as the working directory.
+name: "API Change Auto-Fix"
+description: "Scans a repo for usage of a changed vendor API field and proposes a fix using the caller's own LLM key."
+inputs:
+  trigger-payload:
+    description: "JSON payload describing the detected API change (from client_payload)."
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install -r ${{ github.action_path }}/requirements.txt
+
+    - name: Scan + fix
+      shell: bash
+      env:
+        TRIGGER_PAYLOAD: ${{ inputs.trigger-payload }}
+      run: python ${{ github.action_path }}/apply_fix.py
