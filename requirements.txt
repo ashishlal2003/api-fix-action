@@ -1,2 +1,10 @@
-openai>=1.0.0
+# The agent CLIs (Codex / Claude Code) are installed at run time via npm by
+# agent_backends.py, not from here — they are Node packages, and which one
+# gets installed depends on which key the caller configured.
+#
+# The `openai` SDK is no longer needed: this action no longer makes API calls
+# itself. The agent CLI owns all model interaction, using the caller's key.
+#
+# Telemetry uses urllib from the standard library rather than `requests`, to
+# keep this dependency list minimal on someone else's runner.
 python-dotenv>=1.0.0

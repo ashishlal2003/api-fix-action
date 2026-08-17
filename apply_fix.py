@@ -19,33 +19,66 @@ Trigger flow (polling design — we never call the client, they poll us): an
 earlier step in the CLIENT's own workflow calls our change-feed API on a
 schedule, gets back a JSON body describing what changed (if anything), and
 passes that JSON straight through to this action as the trigger-payload
-input — see action.yml. This script never talks to our API directly and
-never receives more than that one JSON blob.
+input — see action.yml. This script never talks to our API to ASK for work;
+its only outbound call is a best-effort telemetry POST after the fact.
 
-Output: LLM key comes from $OPENAI_API_KEY, which is the CLIENT's own
-secret, set in the CLIENT's repo settings — this script never carries or
-sees any credential belonging to the detection-engine side.
+HOW THE FIX IS PRODUCED
+-----------------------
+A coding agent CLI (Codex or Claude Code) runs on this runner, in the
+client's checkout, driven by the CLIENT's own API key. Which agent runs is
+determined by which key the client configured — see agent_backends.py. The
+agent reads the repo with its own tools and edits files directly; we do not
+grep for the field ourselves, because grepping cannot see indirection or
+distinguish a vendor field from an identically named internal one.
+
+If no agent key is configured, we fall back to the original deterministic
+regex path so the action degrades instead of failing the client's build.
+That path is known-imprecise — see mock-client-repo/FIXTURE.md — and exists
+only as a safety net.
+
+WHAT LEAVES THE RUNNER
+----------------------
+The client's code, the prompt, the agent's output, and the diff all stay on
+this runner. The only thing sent to Zenik is a fixed-schema telemetry record
+of counts and token usage — see telemetry.py, which enumerates every field
+and prints the exact payload into the client's own CI log.
 """
 import json
 import os
-import re
+import subprocess
 import sys
+import time
 from pathlib import Path
 
-# python-dotenv is only useful for local/manual runs. In real GitHub Actions,
-# secrets are already exported as env vars and no .env file exists, so this
-# is a harmless no-op there. Loaded from this script's own directory since
-# the client's working directory (cwd in real CI) is a different repo.
+# python-dotenv is only useful for local/manual runs. In real GitHub Actions
+# secrets arrive as env vars and no .env file exists.
+#
+# `override=False` matters: a .env sitting next to this script must never
+# win over what the caller's workflow explicitly passed in. Without it, a
+# leftover local .env silently supplies an API key the client did not
+# configure — which, for a tool that picks its agent backend based on which
+# key is present, means running (and billing) an agent nobody asked for.
+# Real env vars always take precedence.
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent / ".env")
+# ZENIK_NO_DOTENV=1 skips the .env entirely. Useful for exercising the
+# no-agent-configured path on a developer machine that happens to have keys
+# in a local .env, without having to move the file.
+if os.environ.get("ZENIK_NO_DOTENV") != "1":
+    load_dotenv(Path(__file__).parent / ".env", override=False)
+
+sys.path.insert(0, str(Path(__file__).parent))
+import telemetry  # noqa: E402
+from agent_backends import select_backend  # noqa: E402
+from legacy_scan import run_deterministic_fallback  # noqa: E402
+from prompt import build_fix_prompt  # noqa: E402
+from report import write_report  # noqa: E402
 
 # The client's repo — in real CI this is the working directory GitHub
 # Actions checked the client's code into (actions/checkout on their repo).
 # For a manual/local run, set CLIENT_REPO_PATH to point at a checked-out
 # client repo instead.
 CLIENT_REPO = Path(os.environ.get("CLIENT_REPO_PATH", ".")).resolve()
-REPORT_FILE = CLIENT_REPO / "fix_report.md"
 
 
 def load_trigger():
@@ -70,174 +103,153 @@ def load_trigger():
     return payload
 
 
-def scan_repo_for_field(field_name):
-    """Grep the client repo's source for usage of the removed field."""
-    matches = []
-    pattern = re.compile(rf"\b{re.escape(field_name)}\s*:")
-    for path in (CLIENT_REPO / "src").rglob("*.js"):
-        text = path.read_text()
-        for i, line in enumerate(text.splitlines(), start=1):
-            if pattern.search(line):
-                matches.append({
-                    "file": str(path.relative_to(CLIENT_REPO)),
-                    "line": i,
-                    "content": line.strip(),
-                })
-    return matches
+def git_diff_stats():
+    """Count what actually changed in the working tree.
 
-
-def build_llm_prompt(trigger, matches, removed_field, replacement_field):
-    changes_summary = "\n".join(f"- {c['detail']}" for c in trigger["changes"])
-    match_summary = "\n".join(
-        f"- {m['file']}:{m['line']}  `{m['content']}`" for m in matches
-    )
-    return f"""You are a code-fix assistant running inside a client's CI pipeline.
-A vendor API changed. Here is what changed:
-
-{changes_summary}
-
-The removed/renamed field is `{removed_field}`, replaced by `{replacement_field}`.
-
-The following usage sites in the client's codebase reference the old field:
-{match_summary}
-
-For each usage site, produce the corrected line of code that replaces
-`{removed_field}:` with `{replacement_field}:`, preserving the rest of the line.
-Respond with ONLY a JSON array of objects: [{{"file": ..., "line": ..., "fixed_content": ...}}]
-"""
-
-
-def call_openai(prompt):
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print("[ci-tool] OPENAI_API_KEY not set — falling back to a templated "
-              "fix (no real LLM call). Set OPENAI_API_KEY to exercise the real path.")
-        return None
-
-    try:
-        from openai import OpenAI
-    except ImportError:
-        print("[ci-tool] openai package not installed — falling back to templated fix.")
-        return None
-
-    client = OpenAI(api_key=api_key)
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-    content = resp.choices[0].message.content
-    try:
-        # Strip markdown code fences if the model added them.
-        cleaned = re.sub(r"^```(?:json)?|```$", "", content.strip(), flags=re.MULTILINE).strip()
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        print("[ci-tool] Could not parse LLM response as JSON, falling back to templated fix.")
-        print(f"[ci-tool] Raw response was:\n{content}")
-        return None
-
-
-def templated_fix(matches, removed_field, replacement_field):
-    fixes = []
-    for m in matches:
-        fixed_content = re.sub(
-            rf"\b{re.escape(removed_field)}\s*:",
-            f"{replacement_field}:",
-            m["content"],
-        )
-        fixes.append({
-            "file": m["file"],
-            "line": m["line"],
-            "fixed_content": fixed_content,
-        })
-    return fixes
-
-
-def apply_fixes_in_place(matches, fixes, removed_field):
-    """Rewrite the client's actual source files (not a copy) so a real git
-    commit on a PR branch can be made from the result."""
-    by_file = {}
-    for fix in fixes:
-        by_file.setdefault(fix["file"], []).append(fix)
-
-    changed_files = []
-    for rel_file, file_fixes in by_file.items():
-        src_path = CLIENT_REPO / rel_file
-        lines = src_path.read_text().splitlines()
-        for fix in file_fixes:
-            lines[fix["line"] - 1] = re.sub(
-                rf"^(\s*){re.escape(removed_field)}\s*:.*",
-                lambda m: f"{m.group(1)}{fix['fixed_content'].strip()}",
-                lines[fix["line"] - 1],
+    Deliberately returns COUNTS and file paths separately: the paths are used
+    locally to write the report the client reads, while only the counts are
+    ever passed to telemetry. See telemetry.py for why that split matters.
+    """
+    def _git(*args):
+        try:
+            proc = subprocess.run(
+                ["git", *args], cwd=CLIENT_REPO,
+                capture_output=True, text=True, timeout=60,
             )
-        src_path.write_text("\n".join(lines) + "\n")
-        changed_files.append(rel_file)
-        print(f"[ci-tool] Applied fix directly to {rel_file}")
-    return changed_files
+            return proc.stdout if proc.returncode == 0 else ""
+        except Exception:
+            return ""
 
-
-def write_report(trigger, matches, fixes):
-    report_lines = [
-        "# API Change Auto-Fix Report",
-        "",
-        f"**Vendor:** {trigger['vendor']}",
-        f"**API:** {trigger['api']}",
-        f"**Version change:** {trigger['old_version']} -> {trigger['new_version']}",
-        "",
-        "## Detected changes",
-        "",
-    ]
-    for c in trigger["changes"]:
-        report_lines.append(f"- **[{c['severity']}]** {c['detail']}")
-
-    report_lines += ["", "## Usage sites found in repo", ""]
-    if not matches:
-        report_lines.append("_No usages of the affected field were found in this repo._")
-    for m in matches:
-        report_lines.append(f"- `{m['file']}:{m['line']}` — `{m['content']}`")
-
-    report_lines += ["", "## Applied fix", ""]
-    for fix in fixes:
-        report_lines.append(f"- `{fix['file']}:{fix['line']}` -> `{fix['fixed_content']}`")
-
-    report_lines += [
-        "",
-        "---",
-        "_This fix was generated using the client's own configured LLM credentials. "
-        "No repository content was shared with the API-change detection provider._",
+    changed = [f for f in _git("diff", "--name-only").splitlines() if f.strip()]
+    untracked = [
+        f for f in _git("ls-files", "--others", "--exclude-standard").splitlines()
+        if f.strip() and not f.endswith("fix_report.md")
     ]
 
-    REPORT_FILE.write_text("\n".join(report_lines) + "\n")
-    print(f"[ci-tool] Wrote fix report to {REPORT_FILE}")
+    added = removed = 0
+    for line in _git("diff", "--numstat").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            try:
+                added += int(parts[0])
+                removed += int(parts[1])
+            except ValueError:
+                pass  # binary files show as '-'
+
+    return {
+        "changed_files": changed,
+        "new_files": untracked,
+        "lines_added": added,
+        "lines_removed": removed,
+    }
+
+
+def run_agent(trigger):
+    """Run the client's configured coding agent over their checkout."""
+    preference = os.environ.get("AGENT_BACKEND", "").strip() or None
+    model = os.environ.get("AGENT_MODEL", "").strip() or None
+    try:
+        timeout = int(os.environ.get("AGENT_TIMEOUT_SECONDS", "") or 900)
+    except ValueError:
+        timeout = 900
+
+    backend = select_backend(preference=preference, timeout=timeout, model=model)
+    if backend is None:
+        return None
+
+    print(f"[ci-tool] Using agent backend: {backend.name}")
+    if not backend.ensure_installed():
+        print(f"[ci-tool] Could not install {backend.package}.")
+        from agent_backends import AgentResult
+        return AgentResult(
+            backend=backend.name, ok=False,
+            error=f"failed to install {backend.package}",
+        )
+
+    prompt = build_fix_prompt(trigger)
+    print(f"[ci-tool] Handing the migration task to {backend.name} "
+          f"(sandboxed to this checkout)...")
+
+    started = time.time()
+    result = backend.run(prompt, workdir=str(CLIENT_REPO))
+    result.duration_seconds = round(time.time() - started, 1)
+
+    if result.ok:
+        print(f"[ci-tool] Agent finished in {result.duration_seconds}s.")
+    else:
+        print(f"[ci-tool] Agent did not complete successfully: {result.error}")
+    return result
 
 
 def main():
+    started = time.time()
     trigger = load_trigger()
 
-    removed_fields = [c["field"] for c in trigger["changes"] if c["type"] == "param_removed"]
-    if not removed_fields:
-        print("[ci-tool] No removed params in trigger event. Nothing to fix.")
-        return
-    removed_field = removed_fields[0]
-    replacement_field = "amount"  # known from the spec diff: price -> amount
+    client_key = os.environ.get("ZENIK_CLIENT_KEY", "")
+    api_url = os.environ.get("ZENIK_API_URL", "")
 
-    print(f"[ci-tool] Scanning {CLIENT_REPO} for usage of '{removed_field}'...")
-    matches = scan_repo_for_field(removed_field)
-    print(f"[ci-tool] Found {len(matches)} usage site(s).")
-    for m in matches:
-        print(f"  - {m['file']}:{m['line']}  {m['content']}")
+    agent_result = run_agent(trigger)
 
-    if not matches:
-        print("[ci-tool] No fix needed.")
-        return
+    if agent_result is None:
+        # No agent key configured — fall back to the legacy deterministic
+        # path rather than failing the client's build outright.
+        print("[ci-tool] No agent API key configured (set OPENAI_API_KEY or "
+              "ANTHROPIC_API_KEY). Falling back to the deterministic scanner, "
+              "which is significantly less accurate.")
+        fallback_outcome = run_deterministic_fallback(trigger, CLIENT_REPO)
+        outcome = (telemetry.OUTCOME_FALLBACK if fallback_outcome
+                   else telemetry.OUTCOME_NO_USAGES)
+    elif not agent_result.ok:
+        outcome = telemetry.OUTCOME_AGENT_FAILED
+    else:
+        outcome = None  # determined below from the actual diff
 
-    prompt = build_llm_prompt(trigger, matches, removed_field, replacement_field)
-    fixes = call_openai(prompt)
-    if fixes is None:
-        fixes = templated_fix(matches, removed_field, replacement_field)
+    stats = git_diff_stats()
+    touched = stats["changed_files"] + stats["new_files"]
 
-    apply_fixes_in_place(matches, fixes, removed_field)
-    write_report(trigger, matches, fixes)
+    if outcome is None:
+        outcome = (telemetry.OUTCOME_FIXED if touched
+                   else telemetry.OUTCOME_NO_USAGES)
+
+    write_report(
+        trigger=trigger,
+        stats=stats,
+        agent_result=agent_result,
+        outcome=outcome,
+        report_path=CLIENT_REPO / "fix_report.md",
+    )
+
+    duration = round(time.time() - started, 1)
+    payload = telemetry.build_payload(
+        trigger=trigger,
+        client_key=client_key,
+        repo_full_name=telemetry.env_repo_full_name(),
+        run_id=telemetry.env_run_id(),
+        outcome=outcome,
+        files_changed_count=len(touched),
+        lines_added=stats["lines_added"],
+        lines_removed=stats["lines_removed"],
+        pr_expected=bool(touched),
+        duration_seconds=duration,
+        agent_result=agent_result,
+    )
+    telemetry.print_payload(payload)
+    telemetry.send(payload, api_url=api_url, client_key=client_key)
+
+    # Surface whether a PR should follow, so the workflow can gate the
+    # create-pull-request step instead of opening an empty PR.
+    gh_output = os.environ.get("GITHUB_OUTPUT")
+    if gh_output:
+        with open(gh_output, "a") as f:
+            f.write(f"files-changed={len(touched)}\n")
+            f.write(f"outcome={outcome}\n")
+
+    print(f"[ci-tool] Done. outcome={outcome} files_changed={len(touched)}")
+
+    # A failed agent run is a real failure and should be visible in the
+    # client's CI, but only AFTER telemetry and the report are written.
+    if outcome == telemetry.OUTCOME_AGENT_FAILED:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

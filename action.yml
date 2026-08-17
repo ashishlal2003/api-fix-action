@@ -1,13 +1,66 @@
-# Makes ci-tool/ a reusable GitHub Action, publishable from its OWN repo.
-# A client's workflow references this via `uses: <your-org>/<this-repo>@v1`
+# Makes this repo a reusable GitHub Action, publishable on its own.
+# A client's workflow references it via `uses: <your-org>/<this-repo>@v1`
 # — GitHub fetches this repo at run time and runs the steps below, with the
 # CLIENT's repo already checked out as the working directory.
+#
+# The agent that edits code runs HERE, on the client's runner, driven by the
+# client's own API key. Nothing in this action sends code anywhere.
 name: "API Change Auto-Fix"
-description: "Scans a repo for usage of a changed vendor API field and proposes a fix using the caller's own LLM key."
+description: "Runs the caller's own coding agent (Codex or Claude Code) to migrate their repo when a vendor API changes."
+
 inputs:
   trigger-payload:
     description: "JSON response from polling Zenik's change-feed API, passed through unmodified by the caller's workflow."
     required: true
+
+  openai-api-key:
+    description: >
+      The caller's OpenAI API key. Selects the Codex backend. Passed as an
+      input rather than a job-level env var so it is not readable by other
+      steps or by repository-controlled code in the same job.
+    required: false
+    default: ""
+
+  anthropic-api-key:
+    description: >
+      The caller's Anthropic API key. Selects the Claude Code backend.
+      If both keys are provided, use `agent-backend` to choose.
+    required: false
+    default: ""
+
+  agent-backend:
+    description: "Which agent to use: 'codex' or 'claude-code'. Defaults to whichever key is set (codex if both)."
+    required: false
+    default: ""
+
+  agent-model:
+    description: "Optional model override passed through to the agent CLI."
+    required: false
+    default: ""
+
+  agent-timeout-seconds:
+    description: "Wall-clock limit for the agent run."
+    required: false
+    default: "900"
+
+  zenik-api-url:
+    description: "Base URL of the change-feed API. Used only to report an anonymous run record; see telemetry.py."
+    required: false
+    default: ""
+
+  zenik-client-key:
+    description: "The caller's Zenik client key, used to attribute the run record."
+    required: false
+    default: ""
+
+outputs:
+  files-changed:
+    description: "Number of files the agent modified. 0 means no PR is needed."
+    value: ${{ steps.fix.outputs.files-changed }}
+  outcome:
+    description: "One of: fixed, no_usages_found, agent_failed, fallback_deterministic."
+    value: ${{ steps.fix.outputs.outcome }}
+
 runs:
   using: "composite"
   steps:
@@ -15,12 +68,25 @@ runs:
       with:
         python-version: "3.11"
 
+    # Agent CLIs are distributed via npm; Python drives them.
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
     - name: Install dependencies
       shell: bash
       run: pip install -r ${{ github.action_path }}/requirements.txt
 
     - name: Scan + fix
+      id: fix
       shell: bash
       env:
         TRIGGER_PAYLOAD: ${{ inputs.trigger-payload }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        AGENT_BACKEND: ${{ inputs.agent-backend }}
+        AGENT_MODEL: ${{ inputs.agent-model }}
+        AGENT_TIMEOUT_SECONDS: ${{ inputs.agent-timeout-seconds }}
+        ZENIK_API_URL: ${{ inputs.zenik-api-url }}
+        ZENIK_CLIENT_KEY: ${{ inputs.zenik-client-key }}
       run: python ${{ github.action_path }}/apply_fix.py
