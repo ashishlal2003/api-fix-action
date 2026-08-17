@@ -172,10 +172,28 @@ class CodexBackend(AgentBackend):
         # a silent no-op that looks like success. `-a never` makes it act
         # within the sandbox without asking; anything the sandbox blocks
         # simply fails back to the model instead of prompting.
+        # Codex's default Linux sandbox backend is bubblewrap, which needs to
+        # create a network namespace. On GitHub-hosted runners (and any host
+        # with AppArmor's unprivileged userns restrictions) that is denied,
+        # and bwrap fails every filesystem operation with:
+        #     bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted
+        # The agent then runs, reads nothing, edits nothing, and reports the
+        # sandbox as broken. This is a known Codex bug, not a misconfiguration
+        # on the caller's side (openai/codex issues #17337, #16334, #15982).
+        #
+        # The documented fix is to select the legacy Landlock backend, which
+        # is kernel-level LSM confinement and needs no network namespace.
+        #
+        # We deliberately do NOT fall back to --sandbox danger-full-access if
+        # this fails. The agent runs inside a job that also holds the caller's
+        # API keys, and dropping confinement silently is exactly the kind of
+        # downgrade a caller would never find out about. A hard failure is the
+        # correct outcome — see _check_sandbox_failure below.
         cmd = [
             self.binary, "exec",
             "--json",
             "--sandbox", "workspace-write",
+            "-c", "sandbox_mode.use_legacy_landlock=true",
             "--ask-for-approval", "never",
             "--skip-git-repo-check",
         ]
@@ -203,7 +221,15 @@ class CodexBackend(AgentBackend):
             # up on the migration.
             if proc.returncode != 0 and "unexpected argument" in (proc.stderr or ""):
                 bad = self._unknown_flag(proc.stderr)
-                if bad and bad in cmd:
+                # Never strip a security-relevant flag to make the run
+                # succeed. Dropping --sandbox or the Landlock selector would
+                # silently downgrade confinement, which is precisely what
+                # this action must not do behind the caller's back.
+                if bad in ("--sandbox", "-c", "--config"):
+                    print(f"[agent:{self.name}] this CLI build rejected the "
+                          f"sandbox flag '{bad}'. Refusing to retry without "
+                          f"it — that would run the agent unconfined.")
+                elif bad and bad in cmd:
                     idx = cmd.index(bad)
                     # Drop the flag and its value if it takes one.
                     trimmed = cmd[:idx] + cmd[idx + 2:] if (
@@ -229,6 +255,35 @@ class CodexBackend(AgentBackend):
         """Pull the offending flag out of a clap-style argument error."""
         m = re.search(r"unexpected argument '([^']+)'", stderr or "")
         return m.group(1) if m else None
+
+    @staticmethod
+    def _detect_sandbox_failure(final_message, stderr):
+        """Spot a run where the sandbox itself was broken.
+
+        Returns an explanatory error string, or None if the sandbox was fine.
+        These markers appear when the sandbox backend cannot start, so the
+        agent is alive but every file operation it attempts is denied.
+        """
+        haystack = f"{final_message or ''}\n{stderr or ''}".lower()
+        markers = (
+            "rtm_newaddr",              # bwrap loopback setup denied
+            "bwrap:",                   # any bubblewrap failure
+            "failed to create sandbox",
+            "sandbox was denied",
+            "landlock",                 # landlock backend refused to start
+        )
+        if not any(m in haystack for m in markers):
+            return None
+        return (
+            "the agent's filesystem sandbox failed to start on this runner, so "
+            "no files could be read or written. This is a known Codex issue "
+            "with its bubblewrap backend under AppArmor's unprivileged "
+            "user-namespace restrictions (openai/codex#17337). This action "
+            "requests the Landlock backend instead, and does not fall back to "
+            "running unsandboxed. If Landlock is also unavailable on this "
+            "runner, use the Claude Code backend (set ANTHROPIC_API_KEY) or "
+            "run on a runner image where one of the two backends works."
+        )
 
     def _parse(self, proc):
         usage = AgentUsage()
@@ -269,6 +324,17 @@ class CodexBackend(AgentBackend):
         error = failed_reason
         if not ok and not error:
             error = (proc.stderr or "").strip()[-1000:] or f"exit code {proc.returncode}"
+
+        # A broken sandbox makes Codex exit 0 having done nothing: it reports
+        # the failure in prose and completes the turn "successfully". Left
+        # alone that surfaces as outcome=no_usages_found, which is
+        # indistinguishable from "this repo doesn't use the changed API" —
+        # the worst possible confusion, because it says all-clear when the
+        # migration never ran. Detect it and fail explicitly.
+        sandbox_error = self._detect_sandbox_failure(final_message, proc.stderr)
+        if ok and sandbox_error:
+            ok = False
+            error = sandbox_error
 
         # Echo what the agent said into the client's own workflow log.
         # Without this, a run that completes cleanly but edits nothing is
