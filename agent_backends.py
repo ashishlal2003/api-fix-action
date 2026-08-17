@@ -31,6 +31,7 @@ could not parse a token count.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -175,7 +176,7 @@ class CodexBackend(AgentBackend):
             self.binary, "exec",
             "--json",
             "--sandbox", "workspace-write",
-            "-a", "never",
+            "--ask-for-approval", "never",
             "--skip-git-repo-check",
         ]
         if self.model:
@@ -194,6 +195,26 @@ class CodexBackend(AgentBackend):
                 cmd, cwd=workdir, env=env,
                 capture_output=True, text=True, timeout=self.timeout,
             )
+
+            # CLI flags move between versions. Rather than failing a whole CI
+            # run on an unrecognized argument, drop the optional flag and go
+            # again — the approval flag is a belt-and-braces default, so a
+            # build of the CLI that doesn't accept it is not a reason to give
+            # up on the migration.
+            if proc.returncode != 0 and "unexpected argument" in (proc.stderr or ""):
+                bad = self._unknown_flag(proc.stderr)
+                if bad and bad in cmd:
+                    idx = cmd.index(bad)
+                    # Drop the flag and its value if it takes one.
+                    trimmed = cmd[:idx] + cmd[idx + 2:] if (
+                        idx + 1 < len(cmd) and not cmd[idx + 1].startswith("-")
+                    ) else cmd[:idx] + cmd[idx + 1:]
+                    print(f"[agent:{self.name}] this CLI build rejected '{bad}'; "
+                          f"retrying without it")
+                    proc = subprocess.run(
+                        trimmed, cwd=workdir, env=env,
+                        capture_output=True, text=True, timeout=self.timeout,
+                    )
         except subprocess.TimeoutExpired:
             return AgentResult(
                 backend=self.name, ok=False,
@@ -202,6 +223,12 @@ class CodexBackend(AgentBackend):
             )
 
         return self._parse(proc)
+
+    @staticmethod
+    def _unknown_flag(stderr):
+        """Pull the offending flag out of a clap-style argument error."""
+        m = re.search(r"unexpected argument '([^']+)'", stderr or "")
+        return m.group(1) if m else None
 
     def _parse(self, proc):
         usage = AgentUsage()
@@ -253,6 +280,14 @@ class CodexBackend(AgentBackend):
                 print(f"  | {line}")
         else:
             print(f"[agent:{self.name}] agent returned no summary text.")
+
+        # On failure, stderr usually holds the actual reason (a rejected flag,
+        # an auth problem, a sandbox denial). Print it rather than only the
+        # truncated copy that reaches the report.
+        if not ok and proc.stderr:
+            print(f"[agent:{self.name}] stderr:")
+            for line in proc.stderr.strip().splitlines()[-25:]:
+                print(f"  | {line}")
 
         return AgentResult(
             backend=self.name, ok=ok, usage=usage,
