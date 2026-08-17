@@ -181,27 +181,27 @@ class CodexBackend(AgentBackend):
         # sandbox as broken. This is a known Codex bug, not a misconfiguration
         # on the caller's side (openai/codex issues #17337, #16334, #15982).
         #
-        # The fix is the legacy Landlock backend, a FEATURE FLAG rather than a
-        # sandbox_mode variant (sandbox_mode only accepts read-only /
-        # workspace-write / danger-full-access). Confirmed on the issue thread
-        # as resolving this exact error:
+        # The actual fix is applied BEFORE this runs — see the "Prepare Linux
+        # sandbox" step in action.yml, which installs bubblewrap and loads the
+        # AppArmor profile that lets it create user namespaces. That is what
+        # OpenAI documents for Ubuntu 24.04 (which is what ubuntu-latest is),
+        # so the sandbox works properly rather than being worked around.
         #
-        #     [features]
-        #     use_legacy_landlock = true
+        # The `features.use_legacy_landlock=true` flag is deliberately NOT set
+        # here. It is accepted by this CLI version but Landlock also fails on
+        # GitHub runners ("every command, including /bin/true, fails before
+        # execution"), and openai/codex#18800 indicates the flag is being
+        # removed. Fixing the bubblewrap prerequisites is the durable answer.
         #
-        # Landlock is kernel-LSM confinement and needs no network namespace,
-        # so it works where bubblewrap is denied.
-        #
-        # We deliberately do NOT fall back to --sandbox danger-full-access.
-        # The agent runs inside a job that also holds the caller's API keys,
-        # and dropping confinement silently is exactly the kind of downgrade a
-        # caller would never find out about. A hard failure is the correct
-        # outcome — see _detect_sandbox_failure below.
+        # We do NOT fall back to --sandbox danger-full-access. The agent runs
+        # in a job that also holds the caller's API keys, and silently
+        # dropping confinement is the kind of downgrade a caller would never
+        # discover. If the sandbox can't start, the run fails — see
+        # _detect_sandbox_failure below.
         cmd = [
             self.binary, "exec",
             "--json",
             "--sandbox", "workspace-write",
-            "-c", "features.use_legacy_landlock=true",
             "--ask-for-approval", "never",
             "--skip-git-repo-check",
         ]

@@ -77,6 +77,67 @@ runs:
       shell: bash
       run: pip install -r ${{ github.action_path }}/requirements.txt
 
+    # Codex's Linux sandbox uses bubblewrap, which needs to create an
+    # unprivileged user namespace. On Ubuntu 24.04 — which is what
+    # ubuntu-latest runners are — AppArmor blocks that unless the
+    # bwrap-userns-restrict profile is loaded, and bwrap then fails every
+    # command with "Failed RTM_NEWADDR: Operation not permitted".
+    #
+    # This is the fix OpenAI documents for Ubuntu 24.04 rather than a
+    # workaround: install bubblewrap and load the AppArmor profile that
+    # permits its user namespaces. Doing it here keeps the agent properly
+    # sandboxed instead of resorting to --sandbox danger-full-access.
+    #
+    # Every command is tolerant of failure: on a runner where this isn't
+    # needed (a non-Ubuntu image, or a container without sudo) the setup is
+    # skipped and the agent still runs. If the sandbox genuinely can't start,
+    # apply_fix.py fails the run explicitly rather than proceeding unsandboxed.
+    - name: Prepare Linux sandbox for the agent
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" != "Linux" ]; then
+          echo "[sandbox-setup] not Linux; nothing to do"
+          exit 0
+        fi
+        if ! command -v sudo >/dev/null 2>&1; then
+          echo "[sandbox-setup] no sudo available; skipping"
+          exit 0
+        fi
+
+        echo "[sandbox-setup] installing bubblewrap + apparmor profiles"
+        sudo apt-get update -qq || true
+        sudo apt-get install -y -qq bubblewrap apparmor-profiles apparmor-utils || true
+
+        PROFILE=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+        if [ -f "$PROFILE" ]; then
+          echo "[sandbox-setup] loading bwrap-userns-restrict AppArmor profile"
+          sudo install -m 0644 "$PROFILE" /etc/apparmor.d/bwrap-userns-restrict || true
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict || true
+        else
+          echo "[sandbox-setup] profile not present at $PROFILE"
+        fi
+
+        # Verify: this is the exact operation that fails when AppArmor blocks
+        # bwrap. Its result tells us whether the sandbox will work before we
+        # spend an agent run finding out.
+        if command -v bwrap >/dev/null 2>&1; then
+          if bwrap --unshare-all --dev-bind / / /bin/true 2>/dev/null; then
+            echo "[sandbox-setup] OK — bubblewrap can create a user namespace"
+          else
+            echo "[sandbox-setup] WARNING: bubblewrap still cannot create a user"
+            echo "[sandbox-setup] namespace. Trying the documented sysctl fallback."
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+            if bwrap --unshare-all --dev-bind / / /bin/true 2>/dev/null; then
+              echo "[sandbox-setup] OK after sysctl adjustment"
+            else
+              echo "[sandbox-setup] bubblewrap sandbox is unavailable on this runner."
+              echo "[sandbox-setup] The agent step will fail rather than run unsandboxed."
+            fi
+          fi
+        else
+          echo "[sandbox-setup] bwrap not installed; the agent step will report it"
+        fi
+
     - name: Scan + fix
       id: fix
       shell: bash
