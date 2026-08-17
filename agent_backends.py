@@ -164,10 +164,18 @@ class CodexBackend(AgentBackend):
     binary = "codex"
 
     def run(self, prompt, workdir):
+        # `--sandbox workspace-write` grants write access to the checkout, but
+        # the APPROVAL POLICY is separate and defaults to `on-request`: the
+        # agent pauses to ask a human before acting. In CI there is nobody to
+        # ask, so it summarizes what it would do, exits 0, and edits nothing —
+        # a silent no-op that looks like success. `-a never` makes it act
+        # within the sandbox without asking; anything the sandbox blocks
+        # simply fails back to the model instead of prompting.
         cmd = [
             self.binary, "exec",
             "--json",
             "--sandbox", "workspace-write",
+            "-a", "never",
             "--skip-git-repo-check",
         ]
         if self.model:
@@ -234,6 +242,17 @@ class CodexBackend(AgentBackend):
         error = failed_reason
         if not ok and not error:
             error = (proc.stderr or "").strip()[-1000:] or f"exit code {proc.returncode}"
+
+        # Echo what the agent said into the client's own workflow log.
+        # Without this, a run that completes cleanly but edits nothing is
+        # undiagnosable: the summary explaining WHY would otherwise only
+        # reach fix_report.md, which dies with the runner when no PR opens.
+        if final_message:
+            print(f"[agent:{self.name}] agent summary:")
+            for line in final_message.strip().splitlines():
+                print(f"  | {line}")
+        else:
+            print(f"[agent:{self.name}] agent returned no summary text.")
 
         return AgentResult(
             backend=self.name, ok=ok, usage=usage,

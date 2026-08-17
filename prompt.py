@@ -101,6 +101,12 @@ Find EVERY place in this repository that is affected by the change above, and
 fix it. Work from the code itself — do not assume the affected sites all look
 alike or all live in one directory.
 
+**Edit the files directly.** You are running unattended in a CI job: there is
+no human available to approve anything, and a plan or summary on its own has
+no effect. Making zero edits is only correct if this repository genuinely does
+not call the changed API. If it does call it, you must apply the changes to
+the files themselves before you finish.
+
 Be thorough about where you look:
 
 - Every language in the repo, not just the most common one. Vendor SDKs exist
@@ -135,11 +141,13 @@ field with the same name is not necessarily the vendor's field.
 - Do NOT edit files under .git/, node_modules/, vendor/, dist/, or build/.
 - Do NOT modify CI workflow files, or any file containing credentials.
 
-When you are genuinely unsure whether a given site is the vendor's field or an
-unrelated internal one, LEAVE IT ALONE and say so in your summary. A missed
-site is a smaller problem than a wrongly changed one: a human reviews your
-diff in a pull request, and a clear note about an ambiguous case is useful to
-them, whereas a confidently wrong rename buried in a large diff is not.
+This caution applies to INDIVIDUAL ambiguous sites, not to the task as a
+whole. When you are genuinely unsure whether one particular site is the
+vendor's field or an unrelated internal one, leave that site alone and note it
+in your summary — then carry on and fix the sites you ARE confident about. A
+single wrongly renamed field is worse than a single missed one, but skipping
+the whole migration is worse than either: the repository stays broken against
+the new API and nobody is told why.
 
 ## When you are done
 

@@ -211,6 +211,17 @@ def main():
         outcome = (telemetry.OUTCOME_FIXED if touched
                    else telemetry.OUTCOME_NO_USAGES)
 
+    # An agent that ran successfully but changed nothing is ambiguous: it
+    # either correctly found no affected code, or it silently no-op'd (e.g.
+    # it produced a plan instead of edits). Those need different responses,
+    # so make the distinction loud in the log rather than reporting a clean
+    # "no usages found" for both.
+    if (agent_result is not None and agent_result.ok and not touched):
+        print("[ci-tool] NOTE: the agent completed without editing any files. "
+              "If this repository does call the changed API, that is a silent "
+              "no-op rather than a clean result — check the agent summary "
+              "above for whether it explained why.")
+
     write_report(
         trigger=trigger,
         stats=stats,
