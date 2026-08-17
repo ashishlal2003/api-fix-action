@@ -181,19 +181,27 @@ class CodexBackend(AgentBackend):
         # sandbox as broken. This is a known Codex bug, not a misconfiguration
         # on the caller's side (openai/codex issues #17337, #16334, #15982).
         #
-        # The documented fix is to select the legacy Landlock backend, which
-        # is kernel-level LSM confinement and needs no network namespace.
+        # The fix is the legacy Landlock backend, a FEATURE FLAG rather than a
+        # sandbox_mode variant (sandbox_mode only accepts read-only /
+        # workspace-write / danger-full-access). Confirmed on the issue thread
+        # as resolving this exact error:
         #
-        # We deliberately do NOT fall back to --sandbox danger-full-access if
-        # this fails. The agent runs inside a job that also holds the caller's
-        # API keys, and dropping confinement silently is exactly the kind of
-        # downgrade a caller would never find out about. A hard failure is the
-        # correct outcome — see _check_sandbox_failure below.
+        #     [features]
+        #     use_legacy_landlock = true
+        #
+        # Landlock is kernel-LSM confinement and needs no network namespace,
+        # so it works where bubblewrap is denied.
+        #
+        # We deliberately do NOT fall back to --sandbox danger-full-access.
+        # The agent runs inside a job that also holds the caller's API keys,
+        # and dropping confinement silently is exactly the kind of downgrade a
+        # caller would never find out about. A hard failure is the correct
+        # outcome — see _detect_sandbox_failure below.
         cmd = [
             self.binary, "exec",
             "--json",
             "--sandbox", "workspace-write",
-            "-c", "sandbox_mode.use_legacy_landlock=true",
+            "-c", "features.use_legacy_landlock=true",
             "--ask-for-approval", "never",
             "--skip-git-repo-check",
         ]
@@ -266,12 +274,16 @@ class CodexBackend(AgentBackend):
         """
         haystack = f"{final_message or ''}\n{stderr or ''}".lower()
         markers = (
-            "rtm_newaddr",              # bwrap loopback setup denied
-            "bwrap:",                   # any bubblewrap failure
+            "rtm_newaddr",                 # bwrap loopback setup denied
+            "bwrap:",                      # any bubblewrap failure
             "failed to create sandbox",
             "sandbox was denied",
-            "landlock",                 # landlock backend refused to start
+            "landlock: failed",            # landlock backend refused to start
+            "failed to apply landlock",
         )
+        # Note: a bare mention of "landlock" is NOT a failure marker — it is
+        # the backend this action deliberately selects, so it can legitimately
+        # appear in a healthy run's output.
         if not any(m in haystack for m in markers):
             return None
         return (
@@ -279,10 +291,10 @@ class CodexBackend(AgentBackend):
             "no files could be read or written. This is a known Codex issue "
             "with its bubblewrap backend under AppArmor's unprivileged "
             "user-namespace restrictions (openai/codex#17337). This action "
-            "requests the Landlock backend instead, and does not fall back to "
-            "running unsandboxed. If Landlock is also unavailable on this "
-            "runner, use the Claude Code backend (set ANTHROPIC_API_KEY) or "
-            "run on a runner image where one of the two backends works."
+            "already requests the Landlock backend via "
+            "`features.use_legacy_landlock=true` and does not fall back to "
+            "running unsandboxed. If Landlock is unavailable here too, run on "
+            "a runner image where one of the two backends works."
         )
 
     def _parse(self, proc):
@@ -450,10 +462,24 @@ class ClaudeCodeBackend(AgentBackend):
         subtype = payload.get("subtype", "")
         ok = proc.returncode == 0 and not is_error and subtype != "error"
 
+        final_message = payload.get("result") or ""
+
+        # Same reasoning as the Codex adapter: surface what the agent said
+        # into the caller's own workflow log, so a run that completes but
+        # edits nothing is diagnosable without opening a PR to read the report.
+        if final_message:
+            print(f"[agent:{self.name}] agent summary:")
+            for line in final_message.strip().splitlines():
+                print(f"  | {line}")
+        if not ok and proc.stderr:
+            print(f"[agent:{self.name}] stderr:")
+            for line in proc.stderr.strip().splitlines()[-25:]:
+                print(f"  | {line}")
+
         return AgentResult(
             backend=self.name, ok=ok, usage=usage,
-            final_message=payload.get("result") or "",
-            error="" if ok else (payload.get("result") or subtype or "agent reported an error"),
+            final_message=final_message,
+            error="" if ok else (final_message or subtype or "agent reported an error"),
             model=model, cli_version=self._cli_version(),
         )
 
