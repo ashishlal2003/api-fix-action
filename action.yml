@@ -92,8 +92,18 @@ runs:
     # needed (a non-Ubuntu image, or a container without sudo) the setup is
     # skipped and the agent still runs. If the sandbox genuinely can't start,
     # apply_fix.py fails the run explicitly rather than proceeding unsandboxed.
+    # Only relevant to the Codex backend. This mirrors the backend selection
+    # in agent_backends.select_backend(): Codex runs when it is explicitly
+    # requested, or when OPENAI_API_KEY is the only key set, or when both keys
+    # are set and no preference is given. A caller on Claude Code should not
+    # pay for apt-get installing bubblewrap they will never use.
     - name: Prepare Linux sandbox for the agent
+      if: >-
+        inputs.agent-backend == 'codex' ||
+        (inputs.agent-backend == '' && inputs.openai-api-key != '')
       shell: bash
+      env:
+        AGENT_BACKEND: ${{ inputs.agent-backend }}
       run: |
         if [ "$RUNNER_OS" != "Linux" ]; then
           echo "[sandbox-setup] not Linux; nothing to do"
