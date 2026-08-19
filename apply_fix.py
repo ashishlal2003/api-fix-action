@@ -1,48 +1,4 @@
 #!/usr/bin/env python3
-"""
-CI-side tool — packaged as a standalone GitHub Action (composite action).
-
-This script's home is its OWN repo (published separately from any client's
-repo). A client's workflow references it as `uses: <org>/<this-repo>@v1` —
-GitHub fetches this repo and runs this script, while the CLIENT's repo is
-checked out as the actual working directory. So:
-
-  - `os.getcwd()` / relative paths like `src/` refer to the CLIENT's repo.
-  - This script's own directory (`Path(__file__).parent`) is itself, wherever
-    GitHub happened to stage it — never used for reading client files.
-
-It never touches the client's git history directly; it writes fixed files
-into the client's working tree, and the workflow's own `git commit`/`git push`
-steps (or an action like create-pull-request) turn that into a real PR.
-
-Trigger flow (polling design — we never call the client, they poll us): an
-earlier step in the CLIENT's own workflow calls our change-feed API on a
-schedule, gets back a JSON body describing what changed (if anything), and
-passes that JSON straight through to this action as the trigger-payload
-input — see action.yml. This script never talks to our API to ASK for work;
-its only outbound call is a best-effort telemetry POST after the fact.
-
-HOW THE FIX IS PRODUCED
------------------------
-A coding agent CLI (Codex or Claude Code) runs on this runner, in the
-client's checkout, driven by the CLIENT's own API key. Which agent runs is
-determined by which key the client configured — see agent_backends.py. The
-agent reads the repo with its own tools and edits files directly; we do not
-grep for the field ourselves, because grepping cannot see indirection or
-distinguish a vendor field from an identically named internal one.
-
-If no agent key is configured, we fall back to the original deterministic
-regex path so the action degrades instead of failing the client's build.
-That path is known-imprecise — see mock-client-repo/FIXTURE.md — and exists
-only as a safety net.
-
-WHAT LEAVES THE RUNNER
-----------------------
-The client's code, the prompt, the agent's output, and the diff all stay on
-this runner. The only thing sent to Zenik is a fixed-schema telemetry record
-of counts and token usage — see telemetry.py, which enumerates every field
-and prints the exact payload into the client's own CI log.
-"""
 import json
 import os
 import subprocess

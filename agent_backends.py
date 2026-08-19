@@ -40,8 +40,20 @@ from typing import Optional
 # Pinned CLI versions. Unpinned installs mean a vendor's release can silently
 # change behavior inside a client's CI run, which is exactly the kind of
 # surprise a tool operating on someone else's codebase must not have.
-CODEX_PACKAGE = "@openai/codex"
-CLAUDE_PACKAGE = "@anthropic-ai/claude-code"
+#
+# What a bump can break, concretely: the flag spellings in each backend's
+# run(), and the JSON field names each _parse() reads. Both are documented
+# per-backend below. Codex 0.147 already rejected `--ask-for-approval never`
+# once; that is the class of change a pin exists to stop from landing
+# mid-run inside someone else's CI.
+#
+# Bumping these is a deliberate edit: change the version, then re-run the
+# fixture end-to-end for that backend before shipping it.
+CODEX_VERSION = "0.148.0"
+CLAUDE_VERSION = "2.1.235"
+
+CODEX_PACKAGE = f"@openai/codex@{CODEX_VERSION}"
+CLAUDE_PACKAGE = f"@anthropic-ai/claude-code@{CLAUDE_VERSION}"
 
 # Wall-clock ceiling for an agent run. A hung agent must not hold a client's
 # CI runner open indefinitely.
@@ -115,11 +127,32 @@ class AgentBackend:
     def is_configured(cls):
         return bool(os.environ.get(cls.env_key))
 
+    #: Version this backend is pinned to. Set by each subclass.
+    version = None
+
     def ensure_installed(self):
-        """Install the CLI if the runner doesn't already have it."""
-        if shutil.which(self.binary):
-            print(f"[agent:{self.name}] {self.binary} already on PATH")
-            return True
+        """Make the PINNED CLI version available, installing it if needed.
+
+        Checking only for the binary's presence would defeat the pin: a
+        runner image that ships its own copy of the CLI, or a cached global
+        npm dir from an earlier run, would supply an arbitrary version and we
+        would use it without noticing. So a CLI already on PATH is accepted
+        only when its version matches the pin.
+
+        A version we cannot parse is treated as a mismatch and reinstalled.
+        Guessing "close enough" from an unreadable version string is how the
+        pin quietly stops meaning anything.
+        """
+        found = shutil.which(self.binary)
+        if found:
+            current = self._installed_version()
+            if current == self.version:
+                print(f"[agent:{self.name}] {self.binary} {current} "
+                      f"already on PATH (matches pin)")
+                return True
+            print(f"[agent:{self.name}] {self.binary} on PATH reports "
+                  f"{current or 'an unreadable version'}, but this action is "
+                  f"pinned to {self.version}; installing the pinned version")
 
         print(f"[agent:{self.name}] installing {self.package}...")
         proc = subprocess.run(
@@ -129,7 +162,36 @@ class AgentBackend:
         if proc.returncode != 0:
             print(f"[agent:{self.name}] install failed:\n{proc.stderr[-2000:]}")
             return False
-        return bool(shutil.which(self.binary))
+
+        if not shutil.which(self.binary):
+            print(f"[agent:{self.name}] {self.binary} still not on PATH after install")
+            return False
+
+        # Confirm we actually got the pinned version. npm can resolve to
+        # something else (a dist-tag alias, a stale global prefix earlier on
+        # PATH); running an unexpected version is exactly what the pin is
+        # meant to prevent, so say so rather than proceeding silently.
+        installed = self._installed_version()
+        if installed != self.version:
+            print(f"[agent:{self.name}] WARNING: expected {self.version} after "
+                  f"install but {self.binary} reports "
+                  f"{installed or 'an unreadable version'}. Continuing, but the "
+                  f"flag and JSON-field assumptions in this adapter were "
+                  f"written against {self.version}.")
+        return True
+
+    def _installed_version(self):
+        """Bare version number from `<binary> --version`, or None.
+
+        The CLIs do not agree on format — Codex prints `0.148.0`, Claude Code
+        prints `2.1.235 (Claude Code)` — so pull out the first dotted numeric
+        token rather than comparing the raw string.
+        """
+        raw = self._cli_version()
+        if not raw:
+            return None
+        m = re.search(r"\d+\.\d+\.\d+", raw)
+        return m.group(0) if m else None
 
     def _cli_version(self):
         try:
@@ -162,6 +224,7 @@ class CodexBackend(AgentBackend):
     name = "codex"
     env_key = "OPENAI_API_KEY"
     package = CODEX_PACKAGE
+    version = CODEX_VERSION
     binary = "codex"
 
     def run(self, prompt, workdir):
@@ -290,11 +353,19 @@ class CodexBackend(AgentBackend):
             "the agent's filesystem sandbox failed to start on this runner, so "
             "no files could be read or written. This is a known Codex issue "
             "with its bubblewrap backend under AppArmor's unprivileged "
-            "user-namespace restrictions (openai/codex#17337). This action "
-            "already requests the Landlock backend via "
-            "`features.use_legacy_landlock=true` and does not fall back to "
-            "running unsandboxed. If Landlock is unavailable here too, run on "
-            "a runner image where one of the two backends works."
+            "user-namespace restrictions (openai/codex#17337).\n"
+            "The fix is to install bubblewrap and load the "
+            "bwrap-userns-restrict AppArmor profile BEFORE this step — the "
+            "'Prepare Linux sandbox for the agent' step in action.yml does "
+            "exactly that, and probes it with "
+            "`bwrap --unshare-all --dev-bind / / /bin/true`. If you are "
+            "running apply_fix.py directly rather than through the action, "
+            "that preparation has not happened; run it, or use a runner image "
+            "where bubblewrap can create a user namespace.\n"
+            "Note: switching to the Landlock backend is NOT the answer — it "
+            "also fails on GitHub runners, and openai/codex#18800 indicates "
+            "the flag is being removed. This action does not fall back to "
+            "running unsandboxed."
         )
 
     def _parse(self, proc):
@@ -392,6 +463,7 @@ class ClaudeCodeBackend(AgentBackend):
     name = "claude-code"
     env_key = "ANTHROPIC_API_KEY"
     package = CLAUDE_PACKAGE
+    version = CLAUDE_VERSION
     binary = "claude"
 
     def run(self, prompt, workdir):
