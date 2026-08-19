@@ -589,7 +589,8 @@ def select_backend(preference=None, timeout=DEFAULT_TIMEOUT_SECONDS, model=None)
     if not configured:
         return None
     if len(configured) > 1:
-        print("[agent] multiple provider keys configured; defaulting to codex. "
-              "Set the 'agent-backend' input to choose explicitly.")
+        print("[agent] both OPENAI_API_KEY and ANTHROPIC_API_KEY are set; "
+              "defaulting to codex. To run the other one, either unset the "
+              "key you do not want or pass the 'agent-backend' input.")
         return CodexBackend(timeout=timeout, model=model)
     return configured[0](timeout=timeout, model=model)
